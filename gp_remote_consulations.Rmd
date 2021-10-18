@@ -1,0 +1,460 @@
+---
+title: "Trends in GP remote consulations: England, Mar 2019-Sept 2021"
+author: Mark Green and Vittal Katikeriddi
+output: 
+  html_notebook:
+    code_folding: hide
+---
+
+```{r}
+# Libraries
+library(data.table) # For data wrangling
+library(lubridate) # To deal with date information
+library(patchwork) # To join plots together
+library(ggplot2) # For visualisations
+library(viridis) # To allow for colour-blind friendly colours
+library(readxl) # To load in excel files
+library(sf) # For dealing with spatial data
+
+```
+
+## Purpose
+
+The **aim** of our study is to investigate trends in General Practice (GP) consultations across England. This work is undertaken as part of a 'healthcare disruption' fellowship.
+
+## Data
+
+Summary statistics for English Clinical Commissioning Groups (CCGs) on GP were accessed from NHS Digital [here](https://digital.nhs.uk/data-and-information/publications/statistical/appointments-in-general-practice). For each CCG, the data include monthly records of all appointments made in GPs, who delivered the care (i.e., GP doctor or other healthcare professional), whether the apointment was attended or not, mode of appointment (e.g., face-to-face, telephone), time inbetween booking and attending. We consider regional patterns since they can help to contextualise trends through examining which populations, areas and communities had different experiences. We were unable to find sub-national data for Scotland, Wales and Northern Ireland. While we refer to the data being for CCGs, they are actually Sustainability and Transformation Partnerships (STPs) which are often the same as CCGs or include some combined CCGs.
+
+We use data from the 2019 Index of Multiple Deprivation (IMD) to help contextualise trends in GP consultations. IMD was accessed from [here](https://www.gov.uk/government/statistics/english-indices-of-deprivation-2019). The data are commonly used by government and academics for measuring neighbourhood deprivation. IMD is measured for Lower Super Output Areas (LSOAs) which are small administrative zones representing ~1500 people. There is no accepted summary measure for aggregating IMD to CCGs. We estimate the number of LSOAs that were in the bottom quintile (20%) of most deprived areas, since this is one measure commonly used by Local Authorities and therefore has some relevance for mapping at CCGs.
+
+All code and resources can be openly accessed [here](https://github.com/markagreen/remote_GP_consultations). The report is created using R notebooks which embed all R code, outputs and plots within this document.
+
+```{r}
+## Load and tidy GP data ##
+
+# Load data
+files <- fs::dir_ls("./Data/CCG monthly consultations/") # Get a list of all files in the folder (each CCG is seperate)
+l <- lapply(files, fread, sep = ",") # Load in monthly data on GP interactions (save as list)
+ccg_consult_month <- rbindlist(l) # Convert to single table
+rm(l, files) # Tidy
+
+# Tidy up dates (some inconsistent coding)
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Apr-20"] <- "APR2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Apr-21"] <- "APR2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Aug-20"] <- "AUG2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Aug-21"] <- "AUG2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Dec-20"] <- "DEC2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Jan-21"] <- "JAN2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Feb-21"] <- "FEB2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Jul-20"] <- "JUL2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Jul-21"] <- "JUL2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Jun-20"] <- "JUN2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Jun-21"] <- "JUN2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Mar-20"] <- "MAR2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Mar-21"] <- "MAR2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "May-20"] <- "MAY2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "May-21"] <- "MAY2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Nov-20"] <- "NOV2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Oct-20"] <- "OCT2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Sep-20"] <- "SEP2020"
+
+## Load and tidy IMD data ##
+
+# Load data
+imd2019 <- read_excel("Data/File_1_-_IMD2019_Index_of_Multiple_Deprivation.xlsx", sheet = "IMD2019") # Load IMD data
+lkup <- fread("./Data/LSOA_(2011)_to_Clinical_Commissioning_Groups_to_Sustainability_and_Transformation_Partnerships_(April_2021)_Lookup_in_England.csv") # Load LSOA to STP lookup
+lkup <- merge(lkup, imd2019, by.x = "LSOA11CD", by.y = "LSOA code (2011)", all.x = T) # Join IMD onto lookup
+
+# Create outcome measure
+lkup$bottomq <- 0
+lkup$bottomq[lkup$`Index of Multiple Deprivation (IMD) Decile` < 3] <- 1 # Define if in bottom quintile
+
+# Aggregate data to CCGs
+stp_imd <- lkup[, list(lsoas = .N, bottomq = sum(bottomq, na.rm=T), mean_rank = mean(`Index of Multiple Deprivation (IMD) Rank`, na.rm=T)), by = "STP21CD"] # Aggregate to STP
+stp_imd$bottomq_pc <- (stp_imd$bottomq / stp_imd$lsoas) * 100 # Calculate measure
+
+```
+
+## Trends in remote consultations
+
+We begin through exploring temporal trends in remote GP consultations. We define remote consultations as those GP interactions that were completed either online (video call) or over the telephone. We will just consider consultations where a patient attended and discount those cases where patients either did not attend or there is missing data for. We also only consider consultations that were completed by a GP only.
+
+```{r}
+## Wrangle data into necessary format for analysis ##
+
+# Reshape data
+ccg_consult_gp <- ccg_consult_month[ccg_consult_month$HCP_TYPE == "GP",] # Keep only GP interactions
+hold <- ccg_consult_gp[, list(freq = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("APPT_STATUS", "APPT_MODE", "Appointment_Month", "STP_ONS")] # Aggregate by whether attended or not, mode of appointment, date, and CCG area
+ccg_consult_gp_wide <- dcast(hold, Appointment_Month + STP_ONS ~ APPT_STATUS + APPT_MODE, value.var = "freq", fill = 0) # Convert to wide (stay long ~ go wide) and fill NAs with 0s
+
+# Create variables
+ccg_consult_gp_wide$telephone_online_pc <- NA # Percentage of attended consultations that were online or telephone
+ccg_consult_gp_wide$telephone_online_pc <- ((ccg_consult_gp_wide$'Attended_Video/Online' + ccg_consult_gp_wide$'Attended_Telephone') / (ccg_consult_gp_wide$'Attended_Face-to-Face' + ccg_consult_gp_wide$'Attended_Home Visit' + ccg_consult_gp_wide$'Attended_Video/Online' + ccg_consult_gp_wide$'Attended_Telephone')) * 100
+
+ccg_consult_gp_wide$dna_in_person <- NA # Percentage of missed appointments face-to-face or at home
+ccg_consult_gp_wide$dna_in_person <- ((ccg_consult_gp_wide$'DNA_Face-to-Face' + ccg_consult_gp_wide$'DNA_Home Visit') / (ccg_consult_gp_wide$'Attended_Face-to-Face' + ccg_consult_gp_wide$'Attended_Home Visit' + ccg_consult_gp_wide$'DNA_Face-to-Face' + ccg_consult_gp_wide$'DNA_Home Visit')) * 100
+
+ccg_consult_gp_wide$dna_phone_online <- NA # Percentage of missed appointments that were online or telephone
+ccg_consult_gp_wide$dna_phone_online <- ((ccg_consult_gp_wide$'DNA_Telephone' + ccg_consult_gp_wide$'DNA_Video/Online') / (ccg_consult_gp_wide$'DNA_Telephone' + ccg_consult_gp_wide$'DNA_Video/Online' + ccg_consult_gp_wide$'Attended_Video/Online' + ccg_consult_gp_wide$'Attended_Telephone')) * 100
+
+## Create monthly average for England ##
+
+# Create England aggregate
+ccg_consult_gp_eng <- ccg_consult_gp[, list(freq = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("APPT_STATUS", "APPT_MODE", "Appointment_Month")] # Aggregate by whether attended or not, mode of appointment, and date for England
+ccg_consult_gp_eng_wide <- dcast(ccg_consult_gp_eng, Appointment_Month ~ APPT_STATUS + APPT_MODE, value.var = "freq", fill = 0) # Convert to wide (stay long ~ go wide) and fill NAs with 0s
+
+# Create variables
+ccg_consult_gp_eng_wide$telephone_online_pc <- NA # Percentage of attended consultations that were online or telephone
+ccg_consult_gp_eng_wide$telephone_online_pc <- ((ccg_consult_gp_eng_wide$'Attended_Video/Online' + ccg_consult_gp_eng_wide$'Attended_Telephone') / (ccg_consult_gp_eng_wide$'Attended_Face-to-Face' + ccg_consult_gp_eng_wide$'Attended_Home Visit' + ccg_consult_gp_eng_wide$'Attended_Video/Online' + ccg_consult_gp_eng_wide$'Attended_Telephone')) * 100
+
+ccg_consult_gp_eng_wide$dna_in_person <- NA # Percentage of missed appointments face-to-face or at home
+ccg_consult_gp_eng_wide$dna_in_person <- ((ccg_consult_gp_eng_wide$'DNA_Face-to-Face' + ccg_consult_gp_eng_wide$'DNA_Home Visit') / (ccg_consult_gp_eng_wide$'Attended_Face-to-Face' + ccg_consult_gp_eng_wide$'Attended_Home Visit' + ccg_consult_gp_eng_wide$'DNA_Face-to-Face' + ccg_consult_gp_eng_wide$'DNA_Home Visit')) * 100
+
+ccg_consult_gp_eng_wide$dna_phone_online <- NA # Percentage of missed appointments that were online or telephone
+ccg_consult_gp_eng_wide$dna_phone_online <- ((ccg_consult_gp_eng_wide$'DNA_Telephone' + ccg_consult_gp_eng_wide$'DNA_Video/Online') / (ccg_consult_gp_eng_wide$'DNA_Telephone' + ccg_consult_gp_eng_wide$'DNA_Video/Online' + ccg_consult_gp_eng_wide$'Attended_Video/Online' + ccg_consult_gp_eng_wide$'Attended_Telephone')) * 100
+
+## Define month as date variable ##
+
+ccg_consult_gp_wide$date <- ceiling_date(dmy(paste("15", ccg_consult_gp_wide$Appointment_Month)), unit = "month") # Fix date at middle of each month
+ccg_consult_gp_wide <- ccg_consult_gp_wide[order(ccg_consult_gp_wide$date)] # Order by date
+ccg_consult_gp_eng_wide$date <- ceiling_date(dmy(paste("15", ccg_consult_gp_eng_wide$Appointment_Month)), unit = "month")
+ccg_consult_gp_eng_wide <- ccg_consult_gp_eng_wide[order(ccg_consult_gp_eng_wide$date)] # Order by date
+
+```
+
+The plot below presents the overall trends in attended remote (online or telephone) GP consultations per month.
+
+```{r echo = TRUE}
+# Add labels for national lockdowns as reference lines
+text_plot <- data.frame(text = c("Lockdown 1", "Lockdown 2", "Lockdown 3"), date = as.Date(c("2020-03-23", "2020-11-05", "2021-01-06")), stringsAsFactors = FALSE) 
+
+# Plot
+plot1 <- ggplot() +
+  geom_path(data = ccg_consult_gp_wide, aes(x = date, y = telephone_online_pc, group = STP_ONS), alpha = 0.1) + # Plot CCGs
+  geom_path(data = ccg_consult_gp_eng_wide, aes(x = date, y = telephone_online_pc)) + # Plot England average
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") + # Add in reference lines
+  geom_text(mapping = aes(x = date, y = 100, label = text), data = text_plot, angle = 90, vjust = 1.5, hjust = 0.9, size = 3) + # Add labels for reference lines
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") + # Define x-axis as date format
+  xlab("Date") + # Add labels
+  ylab("Attended GP appointments via telephone or online (%)") +
+  ylim(0, 100) + # Restrict range of values to be plot
+  labs(title = 'The pandemic has shifted GP consulations remotely', # Add titles
+    subtitle = 'The black line represents the England average, with grey lines being each English CCG. The \nplot shows a large increase in remote consulations post-pandemic, although large heterogentiy \nexists across England', # add \n to split over lines
+    caption = 'Data: NHS Digital') +
+    theme(plot.title = element_text(face = "bold")) # Make title bold
+plot1 # Print
+
+```
+
+If we focus on the England average (black line), we see a consistent trend pre-pandemic (~20%). The plot then shows a large increase in the percentage of GP remote consultations from 21% in March 2020 to 64% in May 2020, as GPs reorganised their delivery of care to respond to the pandemic and deliver care safely. While there has been some criticism of GPs for remote delivery, a large number of face-to-face (n=3,021,757) or home visit (n=25,873) appointments were still delivered in May 2020. From May, there is a steady and consistent decline in remote consulations, which only small jumps following subsequent national lockdowns. Plotting each individual CCG alongside the national average shows wide heterogeneity in experiences across England. Trend lines remain fairly flat pre-pandemic, with greater diversity post-lockdown 1 (and a greater range of values).
+
+We can contextualise the experiences of individual CCGs through considering experiences by deprivation. We next present the same plot, but colour in each individual line by the level of deprivation to see if there are distinct inequalities in experiences.
+
+```{r}
+# Join on IMD data
+ccg_consult_gp_wide <- merge(ccg_consult_gp_wide, stp_imd, by.x = "STP_ONS", by.y = "STP21CD", all.x = T)
+
+plot1_imd <- ggplot() +
+  geom_path(data = ccg_consult_gp_wide, aes(x = date, y = telephone_online_pc, group = STP_ONS, color = bottomq_pc), alpha = 0.4) + # Plot CCGs
+  geom_path(data = ccg_consult_gp_eng_wide, aes(x = date, y = telephone_online_pc)) + # Plot England average
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") + # Add in reference lines
+  geom_text(mapping = aes(x = date, y = 100, label = text), data = text_plot, angle = 90, vjust = 1.5, hjust = 0.9, size = 3) + # Add labels for reference lines
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") + # Define x-axis as date format
+  scale_color_viridis() + # Make colour-blind friendly
+  xlab("Date") + # Add labels
+  ylab("Attended GP appointments via telephone or online (%)") +
+  ylim(0, 100) + # Restrict range of values to be plot
+  labs(title = 'Inequalities in care seeking behaviours have changed post-pandemic',
+    subtitle = 'The black line represents the England average for remote consulations. Each other line represents \nan English CCG coloured by their level of deprivation. Pre-pandemic more deprived CCGs had \nfewer remote consultations, however post-pandemic there is no clear social ordering.', # add \n to split over lines
+    caption = 'Data: NHS Digital',
+    color = "% of LSOAs in bottom quintile") +
+    theme(plot.title = element_text(face = "bold")) + # Make title bold
+  theme(legend.position="bottom")
+plot1_imd # Print
+
+```
+
+What is interesting in the plot is the different patterns pre- and post-pandemic. From March 2019 to March 2020, more deprived CCGs have lower remote consultations and less deprived CCGs have more. Following the adjustment to the pandemic (May 2020 onwards), this same ordering by deprivation is no longer clear. Deprived CCGs tend to stick closer to the national average with less deprived CCGs having more diverse experiences (i.e., a higher or lower percentage of remote consultations).
+
+We could also represent this same information through calculating a correlation coefficient for each month to describe the overall association between remote consultations and deprivation, and how it changes over time.
+
+```{r}
+# Calculate correlation for each date
+ccg_consult_gp_cor <- ccg_consult_gp_wide[, .(cor = cor(telephone_online_pc, bottomq_pc)), by = "date"] 
+
+# Plot
+plot1_imd2 <- ggplot() +
+  geom_path(data = ccg_consult_gp_cor, aes(x = date, y = cor)) + # Plot correlation
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") + # Add in reference lines
+  geom_text(mapping = aes(x = date, y = 1, label = text), data = text_plot, angle = 90, vjust = 1.5, hjust = 0.9, size = 3) + # Add labels for reference lines
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") + # Define x-axis as date format
+  xlab("Date") + # Labels
+  ylab("Correlation (r)") +
+  ylim(-1, 1) + # y-axis range
+  labs(title = 'Inequalities in care seeking behaviours have changed post-pandemic', # Add titles
+    subtitle = 'The line represents the correlation coefficient between the percentage of GP consulations that \nwere online/telephone and deprivation level (percentage of LSOAs in bottom IMD quintile) for \nEnglish CCGs. It shows there is no association post-pandemic.', # add \n to split over lines
+    caption = 'Data: NHS Digital') +
+    theme(plot.title = element_text(face = "bold")) # Make titles bold
+plot1_imd2 # Print
+
+```
+
+This is quite striking in showing how the nature of the deprivation relationship has changed post-pandemic, although is a little more technical to understand.
+
+## Appointments not attended
+
+We next consider whether people during the pandemic are more or less likely to not attend appointments, and if this varies by remote or in-person appointments. 
+
+```{r echo=TRUE}
+# Save plot for in-person consultations
+plot2_f2f <- ggplot() +
+  geom_path(data = ccg_consult_gp_wide, aes(x = date, y = dna_in_person, group = STP_ONS), alpha = 0.1) +
+  geom_path(data = ccg_consult_gp_eng_wide, aes(x = date, y = dna_in_person)) +
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") +
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") +
+  xlab("Date") +
+  ylab("Did not attend (%)") +
+  ylim(0, 15) +
+  labs(subtitle = "Face-to-face or home visit")
+
+# Save plot for remote consultations
+plot2_remote <- ggplot() +
+  geom_path(data = ccg_consult_gp_wide, aes(x = date, y = dna_phone_online, group = STP_ONS), alpha = 0.1) +
+  geom_path(data = ccg_consult_gp_eng_wide, aes(x = date, y = dna_phone_online)) +
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") +
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") +
+  xlab("Date") +
+  ylab("Did not attend (%)") +
+  ylim(0, 15) +
+  labs(subtitle = "Telephone or online")
+
+# Join plots together
+plot2 <- plot2_f2f + plot2_remote + # Join these plots
+  plot_annotation( # Add titles to the plot
+    title = 'GP consultations by attendence',
+    subtitle = 'The percentage of people who did not attend their GP appointment fell during the pandemic irrespective \nof appointment mode. Each grey line is a CCG, with the black line the average for England.',
+    caption = 'Data: NHS Digital',
+    theme = theme(plot.title = element_text(face = "bold"))
+  )
+plot2 # Print
+
+```
+
+The plots show that there have been declines in missed appointments post-pandemic consistently across England. If we compare March 2020 to May 2020, we see a decline of missed in-person appointments from 4.7% to 2.6% (a relative decline of 45%), and 2.2% to 1.4% remote consultations (a relative decline of 36%) for England overall. Trends for both appointment modes were fairly flat pre-pandemic. For remote appointments, following the immediate decline, trends have been stable over time suggesting that there has been a step change in missed appointments. For in-person consultations, the trend during the pandemic has been more erratic although appears to fall post-lockdown (it has been relatively stable since March 2021). 
+
+We also investigate the sporadic nature of some CCG lines for in-person consultations. The line highest pre-pandemic represents Cornwall and Isles of Scilly which remains very high initially, before declining back to the values for the rest of CCGs. There are some spikes in February 2021 with areas such as Frimley (Surrey) CCG, Staffordshire and Stoke CCG, and Bristol, North Somerset and Gloucestershire CCG all high. The spike in May 2021 is Staffordshire and Stoke CCG. 
+
+Again we can investigate these trends by level of deprivation.
+
+```{r echo=TRUE}
+plot2_f2f_imd <- ggplot() +
+  geom_path(data = ccg_consult_gp_wide, aes(x = date, y = dna_in_person, group = STP_ONS, color = bottomq_pc), alpha = 0.4) +
+  geom_path(data = ccg_consult_gp_eng_wide, aes(x = date, y = dna_in_person)) +
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") +
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") +
+  scale_color_viridis() +
+  xlab("Date") +
+  ylab("Did not attend (%)") +
+  ylim(0, 15) +
+  ggtitle("Face-to-face or home visit") +
+  labs(color = "% of LSOAs in bottom quintile") +
+  theme(legend.position="bottom")
+
+plot2_remote_imd <- ggplot() +
+  geom_path(data = ccg_consult_gp_wide, aes(x = date, y = dna_phone_online, group = STP_ONS, color = bottomq_pc), alpha = 0.4) +
+  geom_path(data = ccg_consult_gp_eng_wide, aes(x = date, y = dna_phone_online)) +
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") +
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") +
+  scale_color_viridis() +
+  xlab("Date") +
+  ylab("Did not attend (%)") +
+  ylim(0, 15) +
+  ggtitle("Telephone or online") +
+  labs(color = "% of LSOAs in bottom quintile") +
+  theme(legend.position="bottom")
+
+plot2_imd <- plot2_f2f_imd + plot2_remote_imd + 
+  plot_annotation(
+    title = 'GP consultations by attendence and deprivation',
+    subtitle = 'The percentage of people missing appointments fell during the pandemic.\nEach grey line is a region, with the black line the average for England',
+    caption = 'Source: NHS Digital',
+    theme = theme(plot.title = element_text(face = "bold"))
+  ) +
+  plot_layout(guides = 'collect') & theme(legend.position = 'bottom') 
+plot2_imd
+
+```
+
+This is a little unclear to see, so let's repeat the analysis by calculating the correlation coefficient for each month.
+
+```{r echo=TRUE}
+ccg_consult_gp_wide_cor <- ccg_consult_gp_wide[, .(cor1 = cor(dna_phone_online, bottomq_pc), cor2 = cor(dna_in_person, bottomq_pc)), by = "date"] # Calculate correlation by date
+
+plot2_imd_cor <- ggplot() +
+  geom_path(data = ccg_consult_gp_wide_cor, aes(x = date, y = cor1), color = "red") + # Plot remote correlation
+  geom_path(data = ccg_consult_gp_wide_cor, aes(x = date, y = cor2), color = "blue") + # Plot in-person correlation
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") + # Add in reference lines
+  geom_text(mapping = aes(x = date, y = 1, label = text), data = text_plot, angle = 90, vjust = 1.5, hjust = 0.9, size = 3) + # Add labels for reference lines
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") + # Define axis as date
+  xlab("Date") + # Add labels
+  ylab("Correlation (r)") +
+  ylim(-1, 1) + # Define axis range
+  labs(title = 'Inequalities in missed GP appointments have changed post-pandemic', # Add in titles
+       subtitle = 'The blue line is the correlation coefficient between the percentage of missed face-to-face GP \nconsulations and deprivation for English CCGs. The red line is the correlation between \npercentage of missed remote GP consulations and deprivation level', # add \n to split over lines
+       caption = 'Data: NHS Digital') +
+  theme(plot.title = element_text(face = "bold")) # Make title bold
+plot2_imd_cor # Print
+
+```
+
+The plot suggests there is little association between missed remote consultations and deprivation, and that over time this association has been relatively consistent. For in-person consultations, there was a (weak to moderate) positive association pre-pandemic whereby as CCGs were more deprived, the percentage of appointments missed increased. However, between the first and third lockdown, this association disappeared. Since May 2021, the initial association has emerged again, although it is not as strong.
+
+## Same day appointments
+
+```{r}
+## Tidy data to examine time to appointment ##
+
+# Reshape data
+ccg_consult_gp_att <- ccg_consult_month[ccg_consult_month$HCP_TYPE == "GP" & ccg_consult_month$APPT_STATUS == "Attended",] # Keep only attended GP interactions
+ccg_consult_gp_att$remote <- NA
+ccg_consult_gp_att$remote[ccg_consult_gp_att$APPT_MODE == "Telephone" | ccg_consult_gp_att$APPT_MODE == "Video/Online"] <- "Remote"
+ccg_consult_gp_att$remote[ccg_consult_gp_att$APPT_MODE == "Face-to-Face" | ccg_consult_gp_att$APPT_MODE == "Home Visit"] <- "Face-to-Face"
+
+hold <- ccg_consult_gp_att[, list(freq = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("TIME_BETWEEN_BOOK_AND_APPT", "remote", "Appointment_Month", "STP_ONS")] # Aggregate by whether attended or not, mode of appointment, date, and CCG area
+ccg_consult_gp_att_wide <- dcast(hold, Appointment_Month + STP_ONS ~ TIME_BETWEEN_BOOK_AND_APPT + remote, value.var = "freq", fill = 0) # Convert to wide (stay long ~ go wide) and fill NAs with 0s
+
+# Create variables for mapping
+ccg_consult_gp_att_wide$total_remote <- ccg_consult_gp_att_wide$`Same Day_Remote` + ccg_consult_gp_att_wide$`1 Day_Remote` + ccg_consult_gp_att_wide$`2 to 7 Days_Remote` + ccg_consult_gp_att_wide$`8  to 14 Days_Remote` + ccg_consult_gp_att_wide$`15  to 21 Days_Remote` + ccg_consult_gp_att_wide$`22  to 28 Days_Remote` + ccg_consult_gp_att_wide$`More than 28 Days_Remote`
+ccg_consult_gp_att_wide$pc_same_day_remote <- (ccg_consult_gp_att_wide$`Same Day_Remote` / ccg_consult_gp_att_wide$total_remote) * 100
+
+ccg_consult_gp_att_wide$total_f2f <- ccg_consult_gp_att_wide$`Same Day_Face-to-Face` + ccg_consult_gp_att_wide$`1 Day_Face-to-Face` + ccg_consult_gp_att_wide$`2 to 7 Days_Face-to-Face` + ccg_consult_gp_att_wide$`8  to 14 Days_Face-to-Face` + ccg_consult_gp_att_wide$`15  to 21 Days_Face-to-Face` + ccg_consult_gp_att_wide$`22  to 28 Days_Face-to-Face` + ccg_consult_gp_att_wide$`More than 28 Days_Face-to-Face`
+ccg_consult_gp_att_wide$pc_same_day_f2f <- (ccg_consult_gp_att_wide$`Same Day_Face-to-Face` / ccg_consult_gp_att_wide$total_f2f) * 100
+
+## Calculate England average ##
+
+# Aggregate to England
+ccg_consult_gp__att_eng <- ccg_consult_gp_att[, list(freq = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("TIME_BETWEEN_BOOK_AND_APPT", "remote", "Appointment_Month")] # Aggregate by whether time for appointment, mode of appointment, and date for England
+ccg_consult_gp_att_eng_wide <- dcast(ccg_consult_gp__att_eng, Appointment_Month ~ TIME_BETWEEN_BOOK_AND_APPT + remote, value.var = "freq", fill = 0) # Convert to wide (stay long ~ go wide) and fill NAs with 0s
+
+# Create variables
+ccg_consult_gp_att_eng_wide$total_remote <- ccg_consult_gp_att_eng_wide$`Same Day_Remote` + ccg_consult_gp_att_eng_wide$`1 Day_Remote` + ccg_consult_gp_att_eng_wide$`2 to 7 Days_Remote` + ccg_consult_gp_att_eng_wide$`8  to 14 Days_Remote` + ccg_consult_gp_att_eng_wide$`15  to 21 Days_Remote` + ccg_consult_gp_att_eng_wide$`22  to 28 Days_Remote` + ccg_consult_gp_att_eng_wide$`More than 28 Days_Remote`
+ccg_consult_gp_att_eng_wide$pc_same_day_remote <- (ccg_consult_gp_att_eng_wide$`Same Day_Remote` / ccg_consult_gp_att_eng_wide$total_remote) * 100
+
+ccg_consult_gp_att_eng_wide$total_f2f <- ccg_consult_gp_att_eng_wide$`Same Day_Face-to-Face` + ccg_consult_gp_att_eng_wide$`1 Day_Face-to-Face` + ccg_consult_gp_att_eng_wide$`2 to 7 Days_Face-to-Face` + ccg_consult_gp_att_eng_wide$`8  to 14 Days_Face-to-Face` + ccg_consult_gp_att_eng_wide$`15  to 21 Days_Face-to-Face` + ccg_consult_gp_att_eng_wide$`22  to 28 Days_Face-to-Face` + ccg_consult_gp_att_eng_wide$`More than 28 Days_Face-to-Face`
+ccg_consult_gp_att_eng_wide$pc_same_day_f2f <- (ccg_consult_gp_att_eng_wide$`Same Day_Face-to-Face` / ccg_consult_gp_att_eng_wide$total_f2f) * 100
+
+## Define month as date variable ##
+
+ccg_consult_gp_att_wide$date <- ceiling_date(dmy(paste("15", ccg_consult_gp_att_wide$Appointment_Month)), unit = "month") # Fix date at middle of each month
+ccg_consult_gp_att_wide <- ccg_consult_gp_att_wide[order(ccg_consult_gp_att_wide$date)] # Order by date
+ccg_consult_gp_att_eng_wide$date <- ceiling_date(dmy(paste("15", ccg_consult_gp_att_eng_wide$Appointment_Month)), unit = "month")
+ccg_consult_gp_att_eng_wide <- ccg_consult_gp_att_eng_wide[order(ccg_consult_gp_att_eng_wide$date)] # Order by date
+
+```
+
+The final analysis we will consider in this short report is whether there has been an impact on the timeliness of consultations over time. Again, we only consider GP appointments that were attended.
+
+```{r echo=TRUE}
+# Plot
+plot3_sd1 <- ggplot() +
+  geom_path(data = ccg_consult_gp_att_wide, aes(x = date, y = pc_same_day_remote, group = STP_ONS), alpha = 0.1) +
+  geom_path(data = ccg_consult_gp_att_eng_wide, aes(x = date, y = pc_same_day_remote)) +
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") +
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") +
+  #scale_color_viridis() +
+  xlab("Date") +
+  ylab("Percent (%)") +
+  ylim(0, 100) +
+  labs(subtitle = "Telephone or online")
+
+plot3_sd2 <- ggplot() +
+  geom_path(data = ccg_consult_gp_att_wide, aes(x = date, y = pc_same_day_f2f, group = STP_ONS), alpha = 0.1) +
+  geom_path(data = ccg_consult_gp_att_eng_wide, aes(x = date, y = pc_same_day_f2f)) +
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") +
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") +
+  #scale_color_viridis() +
+  xlab("Date") +
+  ylab("Percent (%)") +
+  ylim(0, 100) +
+  labs(subtitle = "Face-to-Face or Home Visit")
+
+# Combine plots together
+plot3 <- plot3_sd1 + plot3_sd2 +
+    plot_annotation(
+    title = 'Same day GP consultations increased after the first lockdown',
+    subtitle = 'The percentage of appointments that were same day increased from April 2020. Each grey line \nis a CCG, with the black line the average for England',
+    caption = 'Source: NHS Digital',
+    theme = theme(plot.title = element_text(face = "bold"))
+  )
+plot3 # Print
+
+```
+
+For both in-person and remote consultations, the majority of appointments occur on the same day that they are booked. This is consistent pre- and post-pandemic. There is a higher percentage of same day appointments for remote than in-person consultations. There is a large increase in n-person appointments following the first lockdown, with trends declining slowly after May 2020. For remote consultations, trends eventually return to similar levels pre-pandemic. However, for in-person consultations, the percentage is higher in August 2021 than pre-pandemic (e.g., 58% in September 2021 vs 51% in March 2020).
+
+We can repeat this plot by including deprivation here too.
+
+```{r echo=TRUE}
+# Join on IMD data
+ccg_consult_gp_att_wide <- merge(ccg_consult_gp_att_wide, stp_imd, by.x = "STP_ONS", by.y = "STP21CD", all.x = T)
+
+# Create individual plots
+plot3_sd1_imd <- ggplot() +
+  geom_path(data = ccg_consult_gp_att_wide, aes(x = date, y = pc_same_day_remote, group = STP_ONS, color = bottomq_pc), alpha = 0.4) +
+  geom_path(data = ccg_consult_gp_att_eng_wide, aes(x = date, y = pc_same_day_remote)) +
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") +
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") +
+  scale_color_viridis() +
+  xlab("Date") +
+  ylab("Percent (%)") +
+  ylim(0, 100) +
+  labs(subtitle = "Telephone or online", color = "% of LSOAs in bottom quintile")
+
+plot3_sd2_imd <- ggplot() +
+  geom_path(data = ccg_consult_gp_att_wide, aes(x = date, y = pc_same_day_f2f, group = STP_ONS, color = bottomq_pc), alpha = 0.4) +
+  geom_path(data = ccg_consult_gp_att_eng_wide, aes(x = date, y = pc_same_day_f2f)) +
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") +
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") +
+  scale_color_viridis() +
+  xlab("Date") +
+  ylab("Percent (%)") +
+  ylim(0, 100) +
+  labs(subtitle = "Face-to-Face or Home Visit", color = "% of LSOAs in bottom quintile")
+
+# Combine to overall plot
+plot3_imd <- plot3_sd1_imd + plot3_sd2_imd +
+    plot_annotation(
+    title = 'Same day GP consultations increased after the first lockdown',
+    subtitle = 'The percentage of appointments that were same day increased from April 2020. Each line \nis a CCG coloured by its level of deprivation, with the black line the average for England',
+    caption = 'Source: NHS Digital',
+    theme = theme(plot.title = element_text(face = "bold"))
+  ) +
+  plot_layout(guides = 'collect') & theme(legend.position = 'bottom') 
+plot3_imd # Print
+
+```
+
+A little hard to interpret, so again we calculate the correlation coefficient to summarised patterns at each month.
+
+```{r echo=TRUE}
+ccg_consult_gp_att_wide_cor <- ccg_consult_gp_att_wide[, .(cor1 = cor(pc_same_day_remote, bottomq_pc), cor2 = cor(pc_same_day_f2f, bottomq_pc)), by = "date"] # Calculate correlation by date
+
+plot3_imd_cor <- ggplot() +
+  geom_path(data = ccg_consult_gp_att_wide_cor, aes(x = date, y = cor1), color = "red") + # Plot remote correlation
+  geom_path(data = ccg_consult_gp_att_wide_cor, aes(x = date, y = cor2), color = "blue") + # Plot in-person correlation
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") + # Add in reference lines
+  geom_text(mapping = aes(x = date, y = 1, label = text), data = text_plot, angle = 90, vjust = 1.5, hjust = 0.9, size = 3) + # Add labels for reference lines
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") + # Define axis as date
+  xlab("Date") + # Add labels
+  ylab("Correlation (r)") +
+  ylim(-1, 1) + # Define axis range
+  labs(title = 'Inequalities in same day appointments have changed post-pandemic', # Add in titles
+       subtitle = 'The blue line is the correlation coefficient between percentage of same day face-to-face GP \nconsultations and deprivation for English CCGs. The red line is the correlation between \npercentage of same day remote GP consultations and deprivation level', # add \n to split over lines
+       caption = 'Data: NHS Digital') +
+  theme(plot.title = element_text(face = "bold")) # Make title bold
+plot3_imd_cor # Print
+
+```
+
+The trend for inequalities in same day in-person appointments is relatively stable, with a (weak to moderate) positive correlation suggesting that areas that are more deprived have a higher percentage of appointments occurring on the same day they were booked. The inverse relationship is observed for remote consultations pre-pandemic (i.e., less deprived areas seeing a higher percentage of remote consultations occurring on the same day they were booked), however any association disappears post-lockdown 1.
