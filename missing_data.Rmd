@@ -1,0 +1,270 @@
+---
+title: "Data quality of NHS Digital GP appointment records"
+author: Mark Green and Vittal Katikeriddi
+output: 
+  html_notebook:
+    code_folding: hide
+---
+
+```{r message=FALSE, warning=FALSE}
+# Libraries
+library(data.table) # For data wrangling
+library(lubridate) # To deal with date information
+library(ggplot2) # For visualisations
+
+```
+
+## Purpose
+
+The **aim** of this report is to investigate the extent of missing data in the data NHS Digital supply for monitoring General Practice (GP) consultations across England (see [here](https://digital.nhs.uk/data-and-information/publications/statistical/appointments-in-general-practice)). This work is to supplement analyses of the dataset and help us assess the quality of the data.
+
+All code and resources can be openly accessed [here](https://github.com/markagreen/remote_GP_consultations). The report is created using R notebooks which embed all R code, outputs and plots within this document.
+
+The structure of the report will assess the extent of missing data on key variables we hae used in our man analysis. Each section of the report is therefore dedicated to each variable.
+
+```{r}
+## Get data ready for analysis ##
+
+# Load data
+files <- fs::dir_ls("./Data/CCG monthly consultations/") # Get list of all files in 
+l <- lapply(files, fread, sep = ",") # Load in monthly data on GP interactions (save as list)
+ccg_consult_month <- rbindlist(l) # Convert to single table
+rm(l, files)
+
+# Tidy up dates (some inconsistent coding)
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Apr-20"] <- "APR2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Apr-21"] <- "APR2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Aug-20"] <- "AUG2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Aug-21"] <- "AUG2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Dec-20"] <- "DEC2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Jan-21"] <- "JAN2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Feb-21"] <- "FEB2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Jul-20"] <- "JUL2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Jul-21"] <- "JUL2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Jun-20"] <- "JUN2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Jun-21"] <- "JUN2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Mar-20"] <- "MAR2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Mar-21"] <- "MAR2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "May-20"] <- "MAY2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "May-21"] <- "MAY2021"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Nov-20"] <- "NOV2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Oct-20"] <- "OCT2020"
+ccg_consult_month$Appointment_Month[ccg_consult_month$Appointment_Month == "Sep-20"] <- "SEP2020"
+
+```
+
+## Who delivered care
+
+The data classify who gave the care; divided into three options: GP, other practice staff and unknown (i.e., missing). Let's examine the total number of appointments over the study period.
+
+```{r echo=TRUE}
+df1 <- ccg_consult_month[, list(Frequency = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("HCP_TYPE")] # Aggregate by variable of interest
+df1$Percent <- (df1$Frequency / sum(df1$Frequency)) * 100 # Calculate percentage
+df1$Percent <- round(df1$Percent, digits = 1) # Round decimal places
+df1 # Print
+
+```
+
+Low missing data here  with 2.9% of all appointments missing this information, which is reassuring. Next, let's consider if this has changed over time to assess if the pandemic has led to additional bias here.
+
+```{r echo=TRUE}
+# Missing data over time - for CCGs
+hold <- ccg_consult_month[, list(freq = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("HCP_TYPE", "Appointment_Month", "STP_ONS")] # Aggregate by month and variable of interest
+missing_wide <- dcast(hold, Appointment_Month + STP_ONS ~ HCP_TYPE, value.var = "freq", fill = 0) # Convert to wide (stay long ~ go wide) and fill NAs with 0s
+missing_wide$pc_unknown <- (missing_wide$Unknown / (missing_wide$GP + missing_wide$`Other Practice staff` + missing_wide$Unknown)) * 100 # Create variable to plot
+
+# re-do for England average
+hold <- ccg_consult_month[, list(freq = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("HCP_TYPE", "Appointment_Month")] # Aggregate by month and variable of interest
+missing_wide_eng <- dcast(hold, Appointment_Month ~ HCP_TYPE, value.var = "freq", fill = 0) # Convert to wide (stay long ~ go wide) and fill NAs with 0s
+missing_wide_eng$pc_unknown <- (missing_wide_eng$Unknown / (missing_wide_eng$GP + missing_wide_eng$`Other Practice staff` + missing_wide_eng$Unknown)) * 100 # Create variable to plot
+
+# Sort out date variable
+missing_wide$date <- ceiling_date(dmy(paste("15", missing_wide$Appointment_Month)), unit = "month") # Fix date at middle of each month
+missing_wide <- missing_wide[order(missing_wide$date)] # Order by date
+missing_wide_eng$date <- ceiling_date(dmy(paste("15", missing_wide_eng$Appointment_Month)), unit = "month") # Fix date at middle of each month
+missing_wide_eng <- missing_wide_eng[order(missing_wide_eng$date)] # Order by date
+
+# Add labels for national lockdowns as reference lines
+text_plot <- data.frame(text = c("Lockdown 1", "Lockdown 2", "Lockdown 3"), date = as.Date(c("2020-03-23", "2020-11-05", "2021-01-06")), stringsAsFactors = FALSE) 
+
+# Plot
+plot1 <- ggplot() +
+  geom_path(data = missing_wide, aes(x = date, y = pc_unknown, group = STP_ONS), alpha = 0.1) + # Plot CCGs
+  geom_path(data = missing_wide_eng, aes(x = date, y = pc_unknown)) + # Plot England average
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") + # Add in reference lines
+  geom_text(mapping = aes(x = date, y = 15, label = text), data = text_plot, angle = 90, vjust = 1.5, hjust = 0.9, size = 3) + # Add labels for reference lines
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") + # Define x-axis as date format
+  xlab("Date") + # Add labels
+  ylab("Missing data (%)") +
+  ylim(0, 15) + # Restrict range of values to be plot
+  labs(title = 'Missing data for who delivered care', # Add titles
+    subtitle = 'The black line represents the England average, with grey lines being each English CCG. The \nplot shows a small increase in missing data over the period.', # add \n to split over lines
+    caption = 'Data: NHS Digital') +
+    theme(plot.title = element_text(face = "bold")) # Make title bold
+plot1 # Print
+
+```
+
+It appears that there has been a slight increase over time, increasing at the England average from 2.5% (March 2019) to 3.2% (August 2021). The extent of this increase probably suggests nothing too much to worry about. Most CCGs follow this general pattern, although there is a wide range of values (most remain below 5%). The single line that has increased considerably post-pandemic is Cornwall And The Isles Of Scilly Health And Social Care Partnership STP (peaking at 12.7% in May 2021).
+
+## Mode of care
+
+The next variable is how care was delivered. Options include face-to-face (at a General Practice), home visit (at a patients home), telephone, online/video call, and unknown (missing).
+
+```{r echo=TRUE}
+df2 <- ccg_consult_month[, list(Frequency = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("APPT_MODE")] # Aggregate by variable of interest
+df2$Percent <- (df2$Frequency / sum(df2$Frequency)) * 100 # Calculate percentage
+df2$Percent <- round(df2$Percent, digits = 1) # Round decimal places
+df2 # Print
+
+```
+
+4.4% of appointments over the whole study period were missing information over mode of care. Let's visualise how this changed over time.
+
+```{r echo=TRUE}
+# Missing data over time - for CCGs
+hold <- ccg_consult_month[, list(freq = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("APPT_MODE", "Appointment_Month", "STP_ONS")] # Aggregate by month and variable of interest
+missing_wide <- dcast(hold, Appointment_Month + STP_ONS ~ APPT_MODE, value.var = "freq", fill = 0) # Convert to wide (stay long ~ go wide) and fill NAs with 0s
+missing_wide$pc_unknown <- (missing_wide$Unknown / (missing_wide$`Face-to-Face` + missing_wide$`Home Visit` + missing_wide$Telephone + missing_wide$Unknown + missing_wide$`Video/Online`)) * 100 # Create variable to plot
+
+# re-do for England average
+hold <- ccg_consult_month[, list(freq = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("APPT_MODE", "Appointment_Month")] # Aggregate by month and variable of interest
+missing_wide_eng <- dcast(hold, Appointment_Month ~ APPT_MODE, value.var = "freq", fill = 0) # Convert to wide (stay long ~ go wide) and fill NAs with 0s
+missing_wide_eng$pc_unknown <- (missing_wide_eng$Unknown / (missing_wide_eng$`Face-to-Face` + missing_wide_eng$`Home Visit` + missing_wide_eng$Telephone + missing_wide_eng$Unknown + missing_wide_eng$`Video/Online`)) * 100 # Create variable to plot
+
+# Sort out date variable
+missing_wide$date <- ceiling_date(dmy(paste("15", missing_wide$Appointment_Month)), unit = "month") # Fix date at middle of each month
+missing_wide <- missing_wide[order(missing_wide$date)] # Order by date
+missing_wide_eng$date <- ceiling_date(dmy(paste("15", missing_wide_eng$Appointment_Month)), unit = "month") # Fix date at middle of each month
+missing_wide_eng <- missing_wide_eng[order(missing_wide_eng$date)] # Order by date
+
+# Add labels for national lockdowns as reference lines
+text_plot <- data.frame(text = c("Lockdown 1", "Lockdown 2", "Lockdown 3"), date = as.Date(c("2020-03-23", "2020-11-05", "2021-01-06")), stringsAsFactors = FALSE) 
+
+# Plot
+plot2 <- ggplot() +
+  geom_path(data = missing_wide, aes(x = date, y = pc_unknown, group = STP_ONS), alpha = 0.1) + # Plot CCGs
+  geom_path(data = missing_wide_eng, aes(x = date, y = pc_unknown)) + # Plot England average
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") + # Add in reference lines
+  geom_text(mapping = aes(x = date, y = 25, label = text), data = text_plot, angle = 90, vjust = 1.5, hjust = 0.9, size = 3) + # Add labels for reference lines
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") + # Define x-axis as date format
+  xlab("Date") + # Add labels
+  ylab("Missing data (%)") +
+  ylim(0, 25) + # Restrict range of values to be plot
+  labs(title = 'Missing data for mode of care', # Add titles
+    subtitle = 'The black line represents the England average, with grey lines being each English CCG. The \nplot shows a decline in missing data over the period.', # add \n to split over lines
+    caption = 'Data: NHS Digital') +
+    theme(plot.title = element_text(face = "bold")) # Make title bold
+plot2 # Print
+
+```
+
+At the national level, there has been a consistent decline in missing data over the study period (falling from 5.8% in March 2019 to 2.8% in August 2021). The decreasing trend appears to be mostly driven by large improvements in a small number of CCGs with very high missing data at the start of the period, with most other CCGs having flat lines over the period.
+
+## Time to appointment
+
+We next consider the time from an individual booking their appointment to being seen. Responses are divided into categories reflecting the time inbetween booking and appointment. We treat 'unknown or data issue' as missing data here.
+
+```{r echo=TRUE}
+df4 <- ccg_consult_month[, list(Frequency = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("TIME_BETWEEN_BOOK_AND_APPT")] # Aggregate by variable of interest
+df4$Percent <- (df4$Frequency / sum(df4$Frequency)) * 100 # Calculate percentage
+df4$Percent <- round(df4$Percent, digits = 2) # Round decimal places
+df4 # Print
+
+```
+
+Overall, there is very little missing data here for this variable (0.04% of all appointments). This probably reflects that the data are generated automatically by the system, rather than needing manual input. While this would suggest that the variable is good, we will still explore if there is any temporal pattern.
+
+```{r echo=TRUE}
+# Missing data over time - for CCGs
+hold <- ccg_consult_month[, list(freq = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("TIME_BETWEEN_BOOK_AND_APPT", "Appointment_Month", "STP_ONS")] # Aggregate by month and variable of interest
+missing_wide <- dcast(hold, Appointment_Month + STP_ONS ~ TIME_BETWEEN_BOOK_AND_APPT, value.var = "freq", fill = 0) # Convert to wide (stay long ~ go wide) and fill NAs with 0s
+missing_wide$pc_unknown <- (missing_wide$`Unknown / Data Issue` / (missing_wide$`1 Day` + missing_wide$`15  to 21 Days` + missing_wide$`22  to 28 Days` + missing_wide$`8  to 14 Days` + missing_wide$`More than 28 Days` + missing_wide$`Same Day` + missing_wide$`Unknown / Data Issue`)) * 100 # Create variable to plot
+
+# re-do for England average
+hold <- ccg_consult_month[, list(freq = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("TIME_BETWEEN_BOOK_AND_APPT", "Appointment_Month")] # Aggregate by month and variable of interest
+missing_wide_eng <- dcast(hold, Appointment_Month ~ TIME_BETWEEN_BOOK_AND_APPT, value.var = "freq", fill = 0) # Convert to wide (stay long ~ go wide) and fill NAs with 0s
+missing_wide_eng$pc_unknown <- (missing_wide_eng$`Unknown / Data Issue` / (missing_wide_eng$`1 Day` + missing_wide_eng$`15  to 21 Days` + missing_wide_eng$`22  to 28 Days` + missing_wide_eng$`8  to 14 Days` + missing_wide_eng$`More than 28 Days` + missing_wide_eng$`Same Day` + missing_wide_eng$`Unknown / Data Issue`)) * 100 # Create variable to plot
+
+# Sort out date variable
+missing_wide$date <- ceiling_date(dmy(paste("15", missing_wide$Appointment_Month)), unit = "month") # Fix date at middle of each month
+missing_wide <- missing_wide[order(missing_wide$date)] # Order by date
+missing_wide_eng$date <- ceiling_date(dmy(paste("15", missing_wide_eng$Appointment_Month)), unit = "month") # Fix date at middle of each month
+missing_wide_eng <- missing_wide_eng[order(missing_wide_eng$date)] # Order by date
+
+# Add labels for national lockdowns as reference lines
+text_plot <- data.frame(text = c("Lockdown 1", "Lockdown 2", "Lockdown 3"), date = as.Date(c("2020-03-23", "2020-11-05", "2021-01-06")), stringsAsFactors = FALSE) 
+
+# Plot
+plot4 <- ggplot() +
+  geom_path(data = missing_wide, aes(x = date, y = pc_unknown, group = STP_ONS), alpha = 0.1) + # Plot CCGs
+  geom_path(data = missing_wide_eng, aes(x = date, y = pc_unknown)) + # Plot England average
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") + # Add in reference lines
+  geom_text(mapping = aes(x = date, y = 1, label = text), data = text_plot, angle = 90, vjust = 1.5, hjust = 0.9, size = 3) + # Add labels for reference lines
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") + # Define x-axis as date format
+  xlab("Date") + # Add labels
+  ylab("Missing data (%)") +
+  ylim(0, 1) + # Restrict range of values to be plot
+  labs(title = 'Missing data for time to appointment', # Add titles
+    subtitle = 'The black line represents the England average, with grey lines being each English CCG. The \nplot shows very low missing data with a slight increase over the period.', # add \n to split over lines
+    caption = 'Data: NHS Digital') +
+    theme(plot.title = element_text(face = "bold")) # Make title bold
+plot4 # Print
+
+```
+The national trend line does have a small increase in the pandemic period, however the values are all very low that this is ok. Similarly, the values for CCGs are all very low, with the highest ones all less than 1%. The line representing the two high lines are both in London - East London Health and Care Partnership (max value 0.8% in May 2021) and Our Healthier South East London (0.6% in July 2021).
+
+## Attended appointment
+
+The final variable we consider is whether an individual attended their appointment. The measure contains three options: attended, did not attend (DNA), and unknown (missing).
+
+```{r echo=TRUE}
+df5 <- ccg_consult_month[, list(Frequency = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("APPT_STATUS")] # Aggregate by variable of interest
+df5$Percent <- (df5$Frequency / sum(df5$Frequency)) * 100 # Calculate percentage
+df5$Percent <- round(df5$Percent, digits = 1) # Round decimal places
+df5 # Print
+
+```
+
+The majority of appointments were attended (90.7%), with 5% having missing data. Let's consider if this value changes over time.
+
+```{r echo=TRUE}
+# Missing data over time - for CCGs
+hold <- ccg_consult_month[, list(freq = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("APPT_STATUS", "Appointment_Month", "STP_ONS")] # Aggregate by month and variable of interest
+missing_wide <- dcast(hold, Appointment_Month + STP_ONS ~ APPT_STATUS, value.var = "freq", fill = 0) # Convert to wide (stay long ~ go wide) and fill NAs with 0s
+missing_wide$pc_unknown <- (missing_wide$Unknown / (missing_wide$Attended + missing_wide$DNA + missing_wide$Unknown)) * 100 # Create variable to plot
+
+# re-do for England average
+hold <- ccg_consult_month[, list(freq = sum(COUNT_OF_APPOINTMENTS, na.rm=T)), by = c("APPT_STATUS", "Appointment_Month")] # Aggregate by month and variable of interest
+missing_wide_eng <- dcast(hold, Appointment_Month ~ APPT_STATUS, value.var = "freq", fill = 0) # Convert to wide (stay long ~ go wide) and fill NAs with 0s
+missing_wide_eng$pc_unknown <- (missing_wide_eng$Unknown / (missing_wide_eng$Attended + missing_wide_eng$DNA + missing_wide_eng$Unknown)) * 100 # Create variable to plot
+
+# Sort out date variable
+missing_wide$date <- ceiling_date(dmy(paste("15", missing_wide$Appointment_Month)), unit = "month") # Fix date at middle of each month
+missing_wide <- missing_wide[order(missing_wide$date)] # Order by date
+missing_wide_eng$date <- ceiling_date(dmy(paste("15", missing_wide_eng$Appointment_Month)), unit = "month") # Fix date at middle of each month
+missing_wide_eng <- missing_wide_eng[order(missing_wide_eng$date)] # Order by date
+
+# Add labels for national lockdowns as reference lines
+text_plot <- data.frame(text = c("Lockdown 1", "Lockdown 2", "Lockdown 3"), date = as.Date(c("2020-03-23", "2020-11-05", "2021-01-06")), stringsAsFactors = FALSE) 
+
+# Plot
+plot5 <- ggplot() +
+  geom_path(data = missing_wide, aes(x = date, y = pc_unknown, group = STP_ONS), alpha = 0.1) + # Plot CCGs
+  geom_path(data = missing_wide_eng, aes(x = date, y = pc_unknown)) + # Plot England average
+  geom_vline(mapping = aes(xintercept = date), data = text_plot, show.legend = FALSE, linetype = "dotted") + # Add in reference lines
+  geom_text(mapping = aes(x = date, y = 20, label = text), data = text_plot, angle = 90, vjust = 1.5, hjust = 0.9, size = 3) + # Add labels for reference lines
+  scale_x_date(date_breaks = "5 months", date_labels =  "%b %Y") + # Define x-axis as date format
+  xlab("Date") + # Add labels
+  ylab("Missing data (%)") +
+  ylim(0, 20) + # Restrict range of values to be plot
+  labs(title = 'Missing data for attendence of appointment', # Add titles
+    subtitle = 'The black line represents the England average, with grey lines being each English CCG. The \nplot shows a increase in missing data post-Lockdown 1, before declining thereafter.', # add \n to split over lines
+    caption = 'Data: NHS Digital') +
+    theme(plot.title = element_text(face = "bold")) # Make title bold
+plot5 # Print
+
+```
+
+The trend line is fairly stable/flat pre-pandemic, before there is a sharp rise and almost doubling in missing data; rising from 5.2% in February 2020 to 9%/9.7% in March/April 2020 respectively). For these few months, there is large heterogeneity in experiences for CCGs with some increasing to very high amounts of missing data (e.g., Bath and North East Somerset, Swindon and Wiltshire has 18% missing in April 2020). Following this initial rise, there is improvement in the data quality with declining missing data. Indeed the level of missingness has declined from 5% in March 2019, to 3.5% in August 2021.
+
