@@ -1,6 +1,6 @@
 # Trends in remote GP consultations for England
 
-Aims: To explore trends in General Practice (GP) consultations for English CCGs pre- and post-pandemic, identify the extent of primary health care disruption, and assess the extent that this has resulted in negative health and inequalities outcomes.
+**Aims:** To explore trends in General Practice (GP) consultations for English CCGs pre- and post-pandemic, identify the extent of primary health care disruption, and assess the extent that this has impacted population health and health inequalities.
 
 The repo is structured as follows:
 
